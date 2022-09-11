@@ -105,6 +105,12 @@ auto m_AnyMul(const LTy &L, const RTy &R) {
   return m_CombineOr(m_Mul(L, R), m_FMul(L, R));
 }
 
+/// Match any add operation (fp or integer).
+template <typename LTy, typename RTy>
+auto m_AnyAdd(const LTy &L, const RTy &R) {
+  return m_CombineOr(m_Add(L, R), m_FAdd(L, R));
+}
+
 namespace {
 
 // Given an element pointer \p BasePtr to the start of a (sub) matrix, compute
@@ -816,6 +822,21 @@ public:
             ReplaceAllUsesWith(I, NewInst);
             EraseFromParent(&I);
             EraseFromParent(TA);
+            // (A + B)^t -> A^t + B^t
+            // RxC RxC      CxR   CxR
+          } else if (match(TA, m_AnyAdd(m_Value(TAMA), m_Value(TAMB)))) {
+            IRBuilder<> LocalBuilder(&I);
+            NewInst = distributeTransposes(
+                TAMA, {R, C}, TAMB, {R, C}, Builder,
+                [&](Value *T0, ShapeInfo Shape0, Value *T1, ShapeInfo Shape1) {
+                  auto *FAdd = cast<Instruction>(
+                      LocalBuilder.CreateFAdd(T0, T1, "mfadd"));
+                  setShapeInfo(FAdd, Shape0);
+                  return FAdd;
+                });
+            ReplaceAllUsesWith(I, NewInst);
+            EraseFromParent(&I);
+            EraseFromParent(TA);
           }
         }
 
@@ -844,6 +865,28 @@ public:
           setShapeInfo(M, {C, R});
           Instruction *NewInst = Builder.CreateMatrixTranspose(
               M, C->getZExtValue(), R->getZExtValue());
+          ReplaceAllUsesWith(I, NewInst);
+          if (I.use_empty())
+            I.eraseFromParent();
+          if (A->use_empty())
+            cast<Instruction>(A)->eraseFromParent();
+          if (A != B && B->use_empty())
+            cast<Instruction>(B)->eraseFromParent();
+        }
+        // A^t + B ^t -> (A + B)^t
+        else if (match(&I, m_FAdd(m_Value(A), m_Value(B))) &&
+                 match(A,
+                       m_Intrinsic<Intrinsic::matrix_transpose>(
+                           m_Value(AT), m_ConstantInt(R), m_ConstantInt(C))) &&
+                 match(B,
+                       m_Intrinsic<Intrinsic::matrix_transpose>(
+                           m_Value(BT), m_ConstantInt(R), m_ConstantInt(C)))) {
+          IRBuilder<> Builder(&I);
+          Value *Add = cast<Instruction>(Builder.CreateFAdd(AT, BT, "mfadd"));
+          setShapeInfo(Add, {C, R});
+          MatrixBuilder MBuilder(Builder);
+          Instruction *NewInst = MBuilder.CreateMatrixTranspose(
+              Add, C->getZExtValue(), R->getZExtValue(), "mfadd_t");
           ReplaceAllUsesWith(I, NewInst);
           if (I.use_empty())
             I.eraseFromParent();
