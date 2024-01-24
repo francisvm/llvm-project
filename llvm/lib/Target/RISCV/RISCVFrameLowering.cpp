@@ -279,17 +279,18 @@ getPushPopEncodingAndNum(const Register MaxReg) {
 // Get the max reg of Push/Pop for restoring callee saved registers.
 static Register getMaxPushPopReg(const MachineFunction &MF,
                                  const std::vector<CalleeSavedInfo> &CSI) {
-  Register MaxPushPopReg = RISCV::NoRegister;
-  for (auto &CS : CSI) {
-    // RISCVRegisterInfo::hasReservedSpillSlot assigns negative frame indices to
-    // registers which can be saved by Zcmp Push.
-    if (CS.getFrameIdx() < 0)
-      MaxPushPopReg = std::max(MaxPushPopReg.id(), CS.getReg().id());
+  auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  // Start from the last register in the sorted list and walk back until one
+  // matches.
+  for (Register Reg : llvm::reverse(RISCVZC::ZcmpPushPopRegs)) {
+    if (!RVFI->getPushableCSRFI(Reg))
+      continue;
+    // if rlist is {rs, s0-s10}, then s11 will also be included
+    if (Reg == RISCV::X26)
+      Reg = RISCV::X27;
+    return Reg;
   }
-  // if rlist is {rs, s0-s10}, then s11 will also be included
-  if (MaxPushPopReg == RISCV::X26)
-    MaxPushPopReg = RISCV::X27;
-  return MaxPushPopReg;
+  return RISCV::NoRegister;
 }
 
 // Return true if the specified function should have a dedicated frame
@@ -369,11 +370,13 @@ static SmallVector<CalleeSavedInfo, 8>
 getUnmanagedCSI(const MachineFunction &MF,
                 const std::vector<CalleeSavedInfo> &CSI) {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
+  auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
   SmallVector<CalleeSavedInfo, 8> NonLibcallCSI;
 
   for (auto &CS : CSI) {
     int FI = CS.getFrameIdx();
-    if (FI >= 0 && MFI.getStackID(FI) == TargetStackID::Default)
+    if (!RVFI->getPushableCSRFI(CS.getReg()) &&
+        MFI.getStackID(FI) == TargetStackID::Default)
       NonLibcallCSI.push_back(CS);
   }
 
@@ -523,7 +526,7 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
   // FIXME (note copied from Lanai): This appears to be overallocating.  Needs
   // investigation. Get the number of bytes to allocate from the FrameInfo.
   uint64_t StackSize = getStackSizeWithRVVPadding(MF);
-  uint64_t RealStackSize = StackSize + RVFI->getReservedSpillsSize();
+  uint64_t RealStackSize = StackSize;
   uint64_t RVVStackSize = RVFI->getRVVStackSize();
 
   // Early exit if there is no need to allocate on the stack
@@ -545,6 +548,9 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
 
   if (RVFI->isPushable(MF) && FirstFrameSetup != MBB.end() &&
       FirstFrameSetup->getOpcode() == RISCV::CM_PUSH) {
+    // The allocation for the pushed registers is handled in the instruction.
+    StackSize -= RVFI->getRVPushStackSize();
+
     // Use available stack adjustment in push instruction to allocate additional
     // stack space.
     uint64_t Spimm = std::min(StackSize, (uint64_t)48);
@@ -581,16 +587,10 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
   for (const auto &Entry : CSI) {
     int FrameIdx = Entry.getFrameIdx();
     int64_t Offset;
-    // Offsets for objects with fixed locations (IE: those saved by libcall) are
+    // Offsets for objects with fixed locations (IE: arguments on the stack) are
     // simply calculated from the frame index.
-    if (FrameIdx < 0) {
-      if (RVFI->isPushable(MF)) {
-        // Callee-saved register stored by Zcmp push is in reverse order.
-        Offset = -(FrameIdx + RVFI->getRVPushRegs() + 1) *
-                 (int64_t)STI.getXLen() / 8;
-      } else {
-        Offset = FrameIdx * (int64_t)STI.getXLen() / 8;
-      }
+    if (RVFI->getPushableCSRFI(Entry.getReg()) || FrameIdx < 0) {
+      Offset = FrameIdx * (int64_t)STI.getXLen() / 8;
     } else {
       Offset = MFI.getObjectOffset(FrameIdx) - RVFI->getReservedSpillsSize();
     }
@@ -780,6 +780,8 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
 
   if (RVFI->isPushable(MF) && MBBI != MBB.end() &&
       MBBI->getOpcode() == RISCV::CM_POP) {
+    // The allocation for the pushed registers is handled in the instruction.
+    StackSize -= RVFI->getRVPushStackSize();
     // Use available stack adjustment in pop instruction to deallocate stack
     // space.
     uint64_t Spimm = std::min(StackSize, (uint64_t)48);
@@ -1026,6 +1028,27 @@ void RISCVFrameLowering::determineCalleeSaves(MachineFunction &MF,
             RISCV::FPR32RegClass.contains(Regs[i]) ||
             RISCV::FPR64RegClass.contains(Regs[i]))
           SavedRegs.set(Regs[i]);
+    }
+  }
+
+  auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
+  // If we're going to use save/restore libcalls or Zcmp push/pop instructions,
+  // create a stack object for them.
+  unsigned SPOffset = 0;
+  if (RVFI->useSaveRestoreLibCalls(MF) || RVFI->isPushable(MF)) {
+    for (Register Reg : RISCVZC::ZcmpPushPopRegs) {
+      if (!SavedRegs[Reg])
+        continue;
+      // if rlist is {rs, s0-s10}, then s11 will also be included
+      if (Reg == RISCV::X26)
+        SavedRegs.set(RISCV::X27);
+      const TargetRegisterClass *RC = TRI->getMinimalPhysRegClass(Reg);
+      unsigned SpillSize = TRI->getSpillSize(*RC);
+      int FI = MFI.CreateFixedSpillStackObject(SpillSize, SPOffset,
+                                               /*isImmutable=*/false);
+      SPOffset += SpillSize;
+      RVFI->setPushableCSRFI(Reg, FI);
     }
   }
 }

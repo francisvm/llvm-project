@@ -660,6 +660,23 @@ inline static bool getSpimm(unsigned RlistVal, unsigned &SpimmVal,
 
 void printRlist(unsigned SlistEncode, raw_ostream &OS);
 void printSpimm(int64_t Spimm, raw_ostream &OS);
+
+// Frame indexes representing locations of CSRs which are given a fixed location
+// by save/restore libcalls or Zcmp Push/Pop.
+static const MCRegister ZcmpPushPopRegs[] = {
+    /*ra*/ RISCV::X1,
+    /*s0*/ RISCV::X8,
+    /*s1*/ RISCV::X9,
+    /*s2*/ RISCV::X18,
+    /*s3*/ RISCV::X19,
+    /*s4*/ RISCV::X20,
+    /*s5*/ RISCV::X21,
+    /*s6*/ RISCV::X22,
+    /*s7*/ RISCV::X23,
+    /*s8*/ RISCV::X24,
+    /*s9*/ RISCV::X25,
+    /*s10*/ RISCV::X26,
+    /*s11*/ RISCV::X27};
 } // namespace RISCVZC
 
 } // namespace llvm

@@ -75,6 +75,8 @@ private:
   unsigned RVPushStackSize = 0;
   unsigned RVPushRegs = 0;
   int RVPushRlist = llvm::RISCVZC::RLISTENCODE::INVALID_RLIST;
+  /// Get the fixed frame index for a Zcmp/libcall save/restore register.
+  DenseMap<Register, int> PushableCSRFIMap;
 
 public:
   RISCVMachineFunctionInfo(const Function &F, const TargetSubtargetInfo *STI) {}
@@ -149,6 +151,18 @@ public:
 
   unsigned getRVPushStackSize() const { return RVPushStackSize; }
   void setRVPushStackSize(unsigned Size) { RVPushStackSize = Size; }
+
+  std::optional<int> getPushableCSRFI(Register Reg) const {
+    auto Found = PushableCSRFIMap.find(Reg);
+    if (Found == PushableCSRFIMap.end())
+      return std::nullopt;
+    return Found->second;
+  }
+  void setPushableCSRFI(MCRegister Reg, int FI) {
+    assert(llvm::is_contained(RISCVZC::ZcmpPushPopRegs, Reg) &&
+           "Expected register in Zcmp/libcall push/pop list");
+    PushableCSRFIMap[Reg] = FI;
+  }
 
   void initializeBaseYamlFields(const yaml::RISCVMachineFunctionInfo &YamlMFI);
 
