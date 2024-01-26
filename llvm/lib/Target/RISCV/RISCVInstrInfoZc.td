@@ -189,7 +189,8 @@ def CM_MVSA01 : RVInst16CA<0b101011, 0b01, 0b10, (outs SR07:$rs1, SR07:$rs2),
                             (ins), "cm.mvsa01", "$rs1, $rs2">;
 } // DecoderNamespace = "RVZcmp", Predicates = [HasStdExtZcmp]...
 
-let DecoderNamespace = "RVZcmp", Predicates = [HasStdExtZcmp] in {
+let DecoderNamespace = "RVZcmp", Predicates = [HasStdExtZcmp],
+    Uses = [X2], Defs = [X2] in {
 let hasSideEffects = 0, mayLoad = 0, mayStore = 1 in
 def CM_PUSH : RVInstZcCPPP<0b11000, "cm.push">;
 
